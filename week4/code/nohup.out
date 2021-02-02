@@ -1,0 +1,9 @@
+--------------------dataset:crosswoz--------------------
+Traceback (most recent call last):
+  File "train.py", line 36, in <module>
+    from crosswoz.postprocess import is_slot_da, calculateF1, recover_intent
+  File "/home/zc/projects/crosswoz/crosswoz/__init__.py", line 1, in <module>
+    from crosswoz.nlu import BERTNLU
+  File "/home/zc/projects/crosswoz/crosswoz/nlu.py", line 6, in <module>
+    from convlab2.util.file_util import cached_path
+ModuleNotFoundError: No module named 'convlab2'
