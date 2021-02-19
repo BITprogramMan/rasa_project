@@ -35,4 +35,6 @@ class Solution:
         automaton = Automaton()
         for c in str:
             automaton.get(c)
+            if automaton.state=='end':
+            	break
         return automaton.sign * automaton.ans
