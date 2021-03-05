@@ -2,10 +2,12 @@ import json
 from tqdm import tqdm
 import os
 import random
-from transformers import BertTokenizer, BertConfig
+from transformers import BertTokenizer
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 import torch
+from functools import partial
+MAX_SEQ_LEN = 512
 
 class MyDataset:
     def __init__(self):
@@ -40,11 +42,13 @@ class MyDataset:
         examples = self.build_examples(data_path, data_cache_path, data_type)
 
         dataset = DSTDataset(examples)
+        shuffle = True if data_type == "train" else False
+        collate = partial(collate_fn, mode=data_type)
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=32,
-            shuffle=True,
-            num_workers=4,
+            shuffle=shuffle,
+            collate_fn=collate
         )
         return dataloader
 
@@ -63,9 +67,12 @@ class MyDataset:
         """
         dials = json.load(open(data_path, "r", encoding="utf8"))
         dials = list(dials.items())
-        pos_examples = []
-        neg_examples = []
-        neg_examples, pos_examples = self.iter_dials(dials, data_type, pos_examples, neg_examples)
+        ##########################
+        debug = True
+        if debug:
+            dials = dials[:20]
+        ##########################
+        pos_examples, neg_examples = self.iter_dials(dials, data_type)
 
         examples = pos_examples + neg_examples
         print(f"{len(dials)} dialogs generate {len(examples)} examples ...")
@@ -79,19 +86,16 @@ class MyDataset:
     def iter_dials(
             self,
             dials,
-            data_type,
-            pos_examples,
-            neg_examples
-    ) -> None:
+            data_type
+    ) :
         """Iterate on dialogues, turns in one dialogue to generate examples
 
         Args:
             dials: raw dialogues data
             data_type: train, dev or tests
-            pos_examples: all positive examples are saved in pos_examples
-            neg_examples: all negative examples are saved in pos_examples
-            process_id: current Process id
         """
+        pos_examples = []
+        neg_examples = []
         for dial_id, dial in tqdm(
                 dials, desc=f"Building {data_type} examples"
         ):
@@ -211,8 +215,13 @@ class MyDataset:
                     turn_id,
                 )
                 self.get_pos_neg_examples(example, pos_examples, neg_examples)
-
-            for value in values:
+            value_num=len(values)
+            if value_num>10:
+                index_list=random.sample(range(value_num),10)
+            else:
+                index_list=range(value_num)
+            for index in index_list:
+                value=values[index]
                 value = "".join(value.split(" "))
                 if slot == "酒店设施":
                     slot_value = slot + f"-{value}"
@@ -243,11 +252,10 @@ class MyDataset:
 
                 self.get_pos_neg_examples(example, pos_examples, neg_examples)
 
-        if self.config["random_undersampling"]:
-            neg_examples = random.sample(
-                neg_examples,
-                k=self.config["neg_pos_sampling_ratio"] * len(pos_examples),
-            )
+        neg_examples = random.sample(
+            neg_examples,
+            k=int(0.9 * len(pos_examples))
+        )
 
         return pos_examples, neg_examples
     @staticmethod
@@ -357,6 +365,121 @@ class DSTDataset(Dataset):
 
     def __len__(self):
         return len(self.input_ids)
+def collate_fn(examples, mode: str = "train") -> dict:
+    """Merge a list of samples to form a mini-batch of Tensor(s)
+
+    generate input_id tensor, token_type_id tensor, attention_mask tensor, pad all tensor to the longest
+    sequence in the batch.
+
+    Args:
+        examples: list of (input_ids, token_type_ids, domain, slot, value, ...)
+        mode: train, dev, tests, infer
+
+    Returns:
+        batch data
+    """
+    batch_examples = {}
+    examples = list(zip(*examples))
+
+    if mode == "infer":
+        (
+            batch_examples["domains"],
+            batch_examples["slots"],
+            batch_examples["values"],
+        ) = examples[2:]
+    else:
+        (
+            batch_examples["domains"],
+            batch_examples["slots"],
+            batch_examples["values"],
+            batch_examples["belief_states"],
+            batch_examples["labels"],
+            batch_examples["dialogue_idxs"],
+            batch_examples["turn_ids"],
+        ) = examples[2:]
+
+    attention_mask, input_ids_tensor, token_type_ids_tensor = get_bert_input(examples)
+
+    data = {
+        "input_ids": input_ids_tensor,
+        "token_type_ids": token_type_ids_tensor,
+        "attention_mask": attention_mask,
+    }
+
+    if mode == "infer":
+        data.update(
+            {
+                "domains": batch_examples["domains"],
+                "slots": batch_examples["slots"],
+                "values": batch_examples["values"],
+            }
+        )
+        return data
+    else:
+        data.update(
+            {"labels": torch.tensor(batch_examples["labels"], dtype=torch.long)}
+        )
+
+    if mode != "train":
+        data.update(
+            {
+                "domains": batch_examples["domains"],
+                "slots": batch_examples["slots"],
+                "values": batch_examples["values"],
+                "belief_states": batch_examples["belief_states"],
+                "dialogue_idxs": batch_examples["dialogue_idxs"],
+                "turn_ids": batch_examples["turn_ids"],
+            }
+        )
+
+    return data
+def get_bert_input(
+    examples,
+) :
+    """Convert input list to torch tensor.
+
+    Args:
+        examples: (input_id_list, )
+
+    Returns:
+        attention_mask, input_ids_tensor, token_type_ids_tensor
+    """
+    input_ids = examples[0]
+    token_type_ids = examples[1]
+    max_seq_len = min(max(len(input_id) for input_id in input_ids), MAX_SEQ_LEN)
+    input_ids_tensor = torch.zeros((len(input_ids), max_seq_len), dtype=torch.long)
+    token_type_ids_tensor = torch.zeros_like(input_ids_tensor)
+    attention_mask = torch.ones_like(input_ids_tensor)
+
+    for i, input_id in enumerate(input_ids):
+        cur_seq_len = len(input_id)
+        if cur_seq_len <= max_seq_len:
+            input_ids_tensor[i, :cur_seq_len] = torch.tensor(input_id, dtype=torch.long)
+            token_type_ids_tensor[i, :cur_seq_len] = torch.tensor(
+                token_type_ids[i], dtype=torch.long
+            )
+            attention_mask[i, cur_seq_len:] = 0
+        else:
+            input_ids_tensor[i] = torch.tensor(
+                input_id[: max_seq_len - 1] + [102], dtype=torch.long
+            )
+            token_type_ids_tensor[i] = torch.tensor(
+                token_type_ids[i][:max_seq_len], dtype=torch.long
+            )
+
+    return attention_mask, input_ids_tensor, token_type_ids_tensor
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
